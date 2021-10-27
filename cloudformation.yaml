@@ -1,0 +1,887 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Stack for the capstone project"
+Resources:
+
+#S3
+    S3Bucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: !Sub "${AWS::StackName}-data"
+
+
+    S3BucketPolicy:
+        Type: "AWS::S3::BucketPolicy"
+        Properties:
+            Bucket: !Ref S3Bucket
+            PolicyDocument: 
+                Version: "2012-10-17"
+                Statement: 
+                  - 
+                    Sid: "AWSCloudTrailAclCheck20150319"
+                    Effect: "Allow"
+                    Principal: 
+                        Service: "cloudtrail.amazonaws.com"
+                    Action: "s3:GetBucketAcl"
+                    Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+                  - 
+                    Sid: "AWSCloudTrailWrite20150319"
+                    Effect: "Allow"
+                    Principal: 
+                        Service: "cloudtrail.amazonaws.com"
+                    Action: "s3:PutObject"
+                    Resource: !Sub "arn:aws:s3:::${S3Bucket}/logs/views/AWSLogs/${AWS::AccountId}/*"
+                    Condition: 
+                        StringEquals: 
+                            "s3:x-amz-acl": "bucket-owner-full-control"
+
+#RDS
+    RDSDBInstance:
+        Type: "AWS::RDS::DBInstance"
+        DeletionPolicy: Delete
+        Properties:
+            DBInstanceIdentifier: !Sub "${AWS::StackName}-rds"
+            AllocatedStorage: 20
+            DBInstanceClass: "db.t2.micro"
+            Engine: "mysql"
+            MasterUsername: "admin"
+            MasterUserPassword: "Passw0rd!"
+            PreferredBackupWindow: "06:51-07:21"
+            BackupRetentionPeriod: 0
+            AvailabilityZone: !Sub "${AWS::Region}f"
+            PreferredMaintenanceWindow: "fri:05:55-fri:06:25"
+            MultiAZ: false
+            EngineVersion: "8.0.23"
+            AutoMinorVersionUpgrade: true
+            LicenseModel: "general-public-license"
+            PubliclyAccessible: true
+            StorageType: "gp2"
+            Port: 3306
+            StorageEncrypted: false
+            MonitoringInterval: 0
+            EnableIAMDatabaseAuthentication: false
+            EnablePerformanceInsights: false
+            DeletionProtection: false
+            DBSubnetGroupName: "default"
+            MaxAllocatedStorage: 1000
+            DBParameterGroupName: "default.mysql8.0"
+            OptionGroupName: "default:mysql-8-0"
+            CACertificateIdentifier: "rds-ca-2019"
+
+#EC2
+
+    EC2Instance:
+        Type: "AWS::EC2::Instance"
+        Properties:
+            ImageId: "ami-02e136e904f3da870"
+            InstanceType: "t2.micro"
+            KeyName: "muravev_aws_gridu"
+            AvailabilityZone: !Sub "${AWS::Region}c"
+            Tenancy: "default"
+            SubnetId: "subnet-4f243661"
+            EbsOptimized: false
+            IamInstanceProfile: !Sub "muravev-ec2"
+            Tags: 
+              - 
+                Key: "Name"
+                Value: !Sub  "${AWS::StackName}-ec2"
+            UserData:
+              Fn::Base64: 
+                !Sub |
+                  #!/bin/bash
+                  sudo yum -y install mysql;
+                  sudo aws s3api get-object --bucket ${AWS::StackName}-code --key items.csv /home/ec2-user/items.csv;
+                  sudo aws s3api get-object --bucket ${AWS::StackName}-code --key requirements.txt /home/ec2-user/requirements.txt;
+                  sudo aws s3api get-object --bucket ${AWS::StackName}-code --key generator.py /home/ec2-user/generator.py;
+                  sudo pip3 install -r requirements.txt;
+                  mysql --user=admin --password=Passw0rd! --host ${RDSDBInstance.Endpoint.Address} --port=3306  -e " 
+                    CREATE DATABASE IF NOT EXISTS testdb; USE testdb; 
+                    CREATE TABLE IF NOT EXISTS items(
+                      id VARCHAR(5),
+                      title VARCHAR(100)  NULL,
+                      description VARCHAR(4000)  NULL,
+                      category VARCHAR(100)  NULL
+                    );
+                    LOAD DATA LOCAL INFILE '/home/ec2-user/items.csv' INTO TABLE items FIELDS TERMINATED BY ',' IGNORE 1 LINES;"
+        DependsOn: RDSDBInstance
+
+#SecretManager
+    SecretsManagerSecret:
+        Type: "AWS::SecretsManager::Secret"
+        Properties:
+            Name: !Sub "${AWS::StackName}-rds-mysql"
+            SecretString: !Sub "{\"username\":\"admin\",\"password\":\"Passw0rd!\",\"engine\":\"mysql\",\"host\":\"${RDSDBInstance.Endpoint.Address}\",\"port\":3306,\"dbInstanceIdentifier\":\"${AWS::StackName}-rds\"}"
+        DependsOn: RDSDBInstance
+
+#Kinesis DataStream
+    KinesisStreamReviews:
+        Type: "AWS::Kinesis::Stream"
+        Properties:
+            Name: !Sub "${AWS::StackName}-capstone-reviews"
+            RetentionPeriodHours: 24
+            ShardCount: 1
+
+    KinesisStreamViews:
+        Type: "AWS::Kinesis::Stream"
+        Properties:
+            Name: !Sub "${AWS::StackName}-capstone-views"
+            RetentionPeriodHours: 24
+            ShardCount: 1
+
+#Kinesis Firehose
+    KinesisFirehoseDeliveryStreamReviews:
+        Type: "AWS::KinesisFirehose::DeliveryStream"
+        Properties:
+            DeliveryStreamName: !Sub "${AWS::StackName}-reviews"
+            DeliveryStreamType: "DirectPut"
+            S3DestinationConfiguration: 
+                BucketARN: !Sub "arn:aws:s3:::${S3Bucket}"
+                BufferingHints: 
+                    SizeInMBs: 5
+                    IntervalInSeconds: 300
+                CloudWatchLoggingOptions: 
+                    Enabled: true
+                    LogGroupName: !Sub "/aws/kinesisfirehose/${AWS::StackName}-reviews"
+                    LogStreamName: "DestinationDelivery"
+                CompressionFormat: "UNCOMPRESSED"
+                EncryptionConfiguration: 
+                    NoEncryptionConfig: "NoEncryption"
+                Prefix: "data/reviews/!{timestamp:YYYY}/!{timestamp:MM}/!{timestamp:dd}/!{timestamp:HH}/"
+                ErrorOutputPrefix: "data/reviews/failures/!{firehose:error-output-type}/!{timestamp:YYYY}/!{timestamp:MM}/!{timestamp:dd}/!{timestamp:HH}/"
+                RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-firehose"
+
+    KinesisFirehoseDeliveryStreamViews:
+        Type: "AWS::KinesisFirehose::DeliveryStream"
+        Properties:
+            DeliveryStreamName: !Sub "${AWS::StackName}-views"
+            DeliveryStreamType: "DirectPut"
+            S3DestinationConfiguration: 
+                BucketARN: !Sub "arn:aws:s3:::${S3Bucket}"
+                BufferingHints: 
+                    SizeInMBs: 5
+                    IntervalInSeconds: 300
+                CloudWatchLoggingOptions: 
+                    Enabled: true
+                    LogGroupName: !Sub "/aws/kinesisfirehose/${AWS::StackName}-views"
+                    LogStreamName: "DestinationDelivery"
+                CompressionFormat: "UNCOMPRESSED"
+                EncryptionConfiguration: 
+                    NoEncryptionConfig: "NoEncryption"
+                Prefix: "data/views/!{timestamp:YYYY}/!{timestamp:MM}/!{timestamp:dd}/!{timestamp:HH}/"
+                ErrorOutputPrefix: "data/views/failures/!{firehose:error-output-type}/!{timestamp:YYYY}/!{timestamp:MM}/!{timestamp:dd}/!{timestamp:HH}/"
+                RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-firehose"
+
+#Kinesis Analytics
+    KinesisAnalyticsApplication:
+        Type: "AWS::KinesisAnalytics::Application"
+        Properties:
+            ApplicationName: !Sub "${AWS::StackName}-capstone-popular-items"
+            ApplicationCode: |
+                CREATE OR REPLACE STREAM "POPULAR_ITEMS"
+                  ("item_id" varchar(5), "items_count" bigint);
+                
+                CREATE OR REPLACE PUMP "ITEMS_PUMP" AS
+                  INSERT INTO "POPULAR_ITEMS"
+                    SELECT STREAM s1.ITEM, s1.ITEM_COUNT
+                      FROM TABLE (TOP_K_ITEMS_TUMBLING(
+                        CURSOR(SELECT STREAM * FROM "SOURCE_SQL_STREAM_001"),
+                        'item_id',         -- name of column in single quotes
+                        10,                -- number of the most frequently occurring values
+                        300                 -- tumbling window size in seconds
+                    )
+                ) as s1
+                ;
+                
+            Inputs: 
+              - 
+                NamePrefix: "SOURCE_SQL_STREAM"
+                InputParallelism: 
+                    Count: 1
+                InputSchema: 
+                    RecordFormat: 
+                        RecordFormatType: "JSON"
+                        MappingParameters: 
+                            JSONMappingParameters: 
+                                RecordRowPath: "$"
+                    RecordEncoding: "UTF-8"
+                    RecordColumns: 
+                      - 
+                        Name: "device_id"
+                        Mapping: "$.device_id"
+                        SqlType: "VARCHAR(8)"
+                      - 
+                        Name: "device_type"
+                        Mapping: "$.device_type"
+                        SqlType: "VARCHAR(16)"
+                      - 
+                        Name: "item_id"
+                        Mapping: "$.item_id"
+                        SqlType: "INTEGER"
+                      - 
+                        Name: "ts"
+                        Mapping: "$.ts"
+                        SqlType: "VARCHAR(32)"
+                      - 
+                        Name: "user_ip"
+                        Mapping: "$.user_ip"
+                        SqlType: "VARCHAR(16)"
+                      - 
+                        Name: "title"
+                        Mapping: "$.title"
+                        SqlType: "VARCHAR(16)"
+                      - 
+                        Name: "description"
+                        Mapping: "$.description"
+                        SqlType: "VARCHAR(32)"
+                      - 
+                        Name: "category"
+                        Mapping: "$.category"
+                        SqlType: "INTEGER"
+                KinesisFirehoseInput: 
+                    ResourceARN: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${KinesisFirehoseDeliveryStreamViews}"
+                    RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-kinesis-analytics"
+                InputProcessingConfiguration: 
+                    InputLambdaProcessor: 
+                        ResourceARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaEnrichViews}:$LATEST"
+                        RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-kinesis-analytics"
+        DependsOn: ["KinesisFirehoseDeliveryStreamViews", "LambdaEnrichViews"]
+
+    KinesisAnalyticsApplicationOutput:
+        Type: "AWS::KinesisAnalytics::ApplicationOutput"
+        Properties:
+            ApplicationName: !Sub "${AWS::StackName}-capstone-popular-items"
+            Output: 
+                Name: "POPULAR_ITEMS"
+                LambdaOutput: 
+                    ResourceARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaPopularItemsNotify}:$LATEST"
+                    RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-kinesis-analytics"
+                DestinationSchema: 
+                    RecordFormatType: "JSON"
+        DependsOn: KinesisAnalyticsApplication
+        
+#StepFunction
+    StepFunctionsStateMachineViews:
+        Type: "AWS::StepFunctions::StateMachine"
+        Properties:
+            StateMachineName: !Sub "${AWS::StackName}-views-step-function"
+            DefinitionString: !Sub |
+                {
+                  "Comment": "This is your state machine",
+                  "StartAt": "StartCrawler",
+                  "States": {
+                    "StartCrawler": {
+                      "Type": "Task",
+                      "Next": "GetCrawler",
+                      "Parameters": {
+                        "Name": "${AWS::StackName}-view-crawler"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler"
+                    },
+                    "GetCrawler": {
+                      "Type": "Task",
+                      "Next": "Choice",
+                      "Parameters": {
+                        "Name": "${AWS::StackName}-view-crawler"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler"
+                    },
+                    "Choice": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Or": [
+                            {
+                              "Variable": "$.Crawler.State",
+                              "StringMatches": "READY"
+                            },
+                            {
+                              "Variable": "$.Crawler.State",
+                              "StringMatches": "RUNNING"
+                            }
+                          ],
+                          "Next": "Wait"
+                        }
+                      ],
+                      "Default": "Athena StartQueryExecution"
+                    },
+                    "Athena StartQueryExecution": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::athena:startQueryExecution",
+                      "Parameters": {
+                        "QueryString": "SELECT device_type, count(*) as views_abs, round( 100.0 * count(*) / sum(count(*)) over() , 2) as \"views_pct_%\" FROM \"${AWS::StackName}-capstone\".\"views\" GROUP BY device_type ORDER BY views_abs desc",
+                        "WorkGroup": "primary",
+                        "ResultConfiguration": {
+                          "OutputLocation": "s3://${S3Bucket}/data/queries/${AWS::StackName}_views_distribution_by_devices"
+                        }
+                      },
+                      "End": true
+                    },
+                    "Wait": {
+                      "Type": "Wait",
+                      "Seconds": 30,
+                      "Next": "GetCrawler"
+                    }
+                  }
+                }
+            RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-step-function"
+            StateMachineType: "STANDARD"
+            LoggingConfiguration: 
+                IncludeExecutionData: false
+                Level: "OFF"
+
+    StepFunctionsStateMachineReviews:
+        Type: "AWS::StepFunctions::StateMachine"
+        Properties:
+            StateMachineName: !Sub "${AWS::StackName}-reviews-step-function"
+            DefinitionString: !Sub |
+                {
+                  "Comment": "This is your state machine",
+                  "StartAt": "StartCrawler",
+                  "States": {
+                    "StartCrawler": {
+                      "Type": "Task",
+                      "Next": "GetCrawler",
+                      "Parameters": {
+                        "Name": "${AWS::StackName}-reviews-crawler"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler"
+                    },
+                    "GetCrawler": {
+                      "Type": "Task",
+                      "Next": "Choice",
+                      "Parameters": {
+                        "Name": "${AWS::StackName}-reviews-crawler"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler"
+                    },
+                    "Choice": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Or": [
+                            {
+                              "Variable": "$.Crawler.State",
+                              "StringMatches": "READY"
+                            },
+                            {
+                              "Variable": "$.Crawler.State",
+                              "StringMatches": "RUNNING"
+                            }
+                          ],
+                          "Next": "Wait"
+                        }
+                      ],
+                      "Default": "Athena StartQueryExecution"
+                    },
+                    "Athena StartQueryExecution": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::athena:startQueryExecution",
+                      "Parameters": {
+                        "QueryString": "SELECT device_type, count(*) as reviews_abs, round( 100.0 * count(*) / sum(count(*)) over() , 2) as \"reviews_pct_%\" FROM \"${AWS::StackName}-capstone\".\"reviews\" GROUP BY device_type ORDER BY reviews_abs desc",
+                        "WorkGroup": "primary",
+                        "ResultConfiguration": {
+                          "OutputLocation": "s3://${S3Bucket}/data/queries/${AWS::StackName}_reviews_distribution_by_devices"
+                        }
+                      },
+                      "End": true
+                    },
+                    "Wait": {
+                      "Type": "Wait",
+                      "Seconds": 30,
+                      "Next": "GetCrawler"
+                    }
+                  }
+                }
+            RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-step-function"
+            StateMachineType: "STANDARD"
+            LoggingConfiguration: 
+                IncludeExecutionData: false
+                Level: "OFF"
+                
+#GLUE
+    GlueCrawler:
+        Type: "AWS::Glue::Crawler"
+        Properties:
+            Name: !Sub "${AWS::StackName}-reviews-crawler"
+            Role: "muravev-glue"
+            Targets: 
+                S3Targets: 
+                  - 
+                    Path: !Sub "s3://${S3Bucket}/data/reviews/"
+            DatabaseName: !Sub "${AWS::StackName}-capstone"
+            SchemaChangePolicy: 
+                UpdateBehavior: "UPDATE_IN_DATABASE"
+                DeleteBehavior: "DEPRECATE_IN_DATABASE"
+
+    GlueCrawler2:
+        Type: "AWS::Glue::Crawler"
+        Properties:
+            Name: !Sub "${AWS::StackName}-view-crawler"
+            Role: "muravev-glue"
+            Targets: 
+                S3Targets: 
+                  - 
+                    Path: !Sub "s3://${S3Bucket}/data/views/"
+            DatabaseName: !Sub "${AWS::StackName}-capstone"
+            SchemaChangePolicy: 
+                UpdateBehavior: "UPDATE_IN_DATABASE"
+                DeleteBehavior: "DEPRECATE_IN_DATABASE"
+    GlueDatabase:
+        Type: "AWS::Glue::Database"
+        Properties:
+            DatabaseInput: 
+                Name: !Sub "${AWS::StackName}-capstone"
+            CatalogId: !Ref "AWS::AccountId"
+
+#SNS
+    SNSTopic:
+        Type: "AWS::SNS::Topic"
+        Properties:
+            DisplayName: ""
+            TopicName: !Sub "${AWS::StackName}-popular-item-notification"
+
+    SNSTopicPolicy:
+        Type: "AWS::SNS::TopicPolicy"
+        Properties:
+            PolicyDocument: !Sub "{\"Version\":\"2008-10-17\",\"Id\":\"__default_policy_ID\",\"Statement\":[{\"Sid\":\"__default_statement_ID\",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":[\"SNS:GetTopicAttributes\",\"SNS:SetTopicAttributes\",\"SNS:AddPermission\",\"SNS:RemovePermission\",\"SNS:DeleteTopic\",\"SNS:Subscribe\",\"SNS:ListSubscriptionsByTopic\",\"SNS:Publish\",\"SNS:Receive\"],\"Resource\":\"${SNSTopic}\",\"Condition\":{\"StringEquals\":{\"AWS:SourceOwner\":\"${AWS::AccountId}\"}}}]}"
+            Topics: 
+              - !Ref SNSTopic
+
+    SNSSubscription:
+        Type: "AWS::SNS::Subscription"
+        Properties:
+            TopicArn: !Ref SNSTopic
+            Endpoint: "emuravev@griddynamics.com"
+            Protocol: "email"
+            Region: !Ref AWS::Region
+
+#CloudTrail
+  #     CloudTrailTrail:
+  #         Type: "AWS::CloudTrail::Trail"
+  #         Properties:
+  #             TrailName: !Sub "${AWS::StackName}-s3-views-event"
+  #             S3BucketName: !Ref S3Bucket
+  #             S3KeyPrefix: "logs/views"
+  #             IncludeGlobalServiceEvents: true
+  #             IsMultiRegionTrail: true
+  #             EnableLogFileValidation: true
+  #             IsLogging: true
+
+#EventsRule
+    EventsRule:
+        Type: "AWS::Events::Rule"
+        Properties:
+            Name: !Sub "${AWS::StackName}-run-stepfunction-on-s3-event-reviews"
+            EventPattern: !Sub |
+                {
+                  "source": ["aws.s3"],
+                  "detail-type": ["AWS API Call via CloudTrail"],
+                  "detail": {
+                    "eventSource": ["s3.amazonaws.com"],
+                    "eventName": ["PutObject"],
+                    "requestParameters": {
+                      "bucketName": ["${S3Bucket}"],
+                      "key": [{
+                        "prefix": "data/reviews/"
+                      }]
+                    }
+                  }
+                }
+            State: "ENABLED"
+            Targets: 
+              - 
+                Arn: !Ref StepFunctionsStateMachineReviews
+                Id: "Idc5d08a00-d297-488c-9d99-9b195e982395"
+                RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-cloudwatch"
+            EventBusName: "default"
+
+    EventsRule2:
+        Type: "AWS::Events::Rule"
+        Properties:
+            Name: !Sub "${AWS::StackName}-run-stepfunction-on-s3-event-views"
+            EventPattern: !Sub |
+                {
+                  "source": ["aws.s3"],
+                  "detail-type": ["AWS API Call via CloudTrail"],
+                  "detail": {
+                    "eventSource": ["s3.amazonaws.com"],
+                    "eventName": ["PutObject"],
+                    "requestParameters": {
+                      "bucketName": ["${S3Bucket}"],
+                      "key": [{
+                        "prefix": "data/views/"
+                      }]
+                    }
+                  }
+                }
+            State: "ENABLED"
+            Targets: 
+              - 
+                Arn: !Ref StepFunctionsStateMachineViews
+                Id: "Idd545e1e3-16dc-405a-912f-309bd284818c"
+                RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-cloudwatch"
+            EventBusName: "default"
+
+#DynamoDB
+    DynamoDBTable:
+        Type: "AWS::DynamoDB::Table"
+        Properties:
+            AttributeDefinitions: 
+              - 
+                AttributeName: "ip"
+                AttributeType: "S"
+            TableName: !Sub "${AWS::StackName}-capstone-suspicious-ip"
+            KeySchema: 
+              - 
+                AttributeName: "ip"
+                KeyType: "HASH"
+            ProvisionedThroughput: 
+                ReadCapacityUnits: 5
+                WriteCapacityUnits: 5
+
+#LAMBDAS
+    LambdaFilterReiews:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${AWS::StackName}-filter-reviews"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+                ZipFile: !Sub |
+                  import json
+                  import boto3
+                  import base64
+
+
+                  def lambda_handler(event, context):
+                      
+                      firehose = boto3.client('firehose')
+                      dynamo_db = boto3.resource('dynamodb')
+                      table = dynamo_db.Table('${AWS::StackName}-capstone-suspicious-ip')
+                      
+                      reviews = []
+                      
+                      for record in event['Records']:
+                          data = json.loads(base64.b64decode(record['kinesis']['data']))
+                          is_suspicious = table.get_item(Key={'ip': data['user_ip']}).get('Item',None)
+                          if not is_suspicious:
+                              output_record = {
+                                  'Data': json.dumps(data) + '\n'
+                              }
+                              reviews.append(output_record)
+                          else:
+                              pass
+
+                      if len(reviews) > 0:
+                          firehose.put_record_batch(
+                              DeliveryStreamName='${AWS::StackName}-reviews',
+                              Records=reviews)
+
+            MemorySize: 128
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-lambda"
+            Runtime: "python3.9"
+            Timeout: 303
+            TracingConfig: 
+                Mode: "PassThrough"
+
+    LambdaFilterViews:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${AWS::StackName}-filter-view"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code:
+                ZipFile: !Sub |
+                  import json
+                  import boto3
+                  import base64
+
+
+                  def lambda_handler(event, context):
+                      
+                      firehose = boto3.client('firehose')
+                      dynamo_db = boto3.resource('dynamodb')
+                      table = dynamo_db.Table('${AWS::StackName}-capstone-suspicious-ip')
+                      
+                      views = []
+                      
+                      for record in event['Records']:
+                          data = json.loads(base64.b64decode(record['kinesis']['data']))
+                          is_suspicious = table.get_item(Key={'ip': data['user_ip']}).get('Item',False)
+                          if not is_suspicious:
+                              output_record = {
+                                  'Data': json.dumps(data) + '\n'
+                              }
+                              views.append(output_record)
+                          else:
+                              pass
+                  
+                      if len(views) > 0:    
+                          firehose.put_record_batch(
+                              DeliveryStreamName='${AWS::StackName}-views',
+                              Records=views)
+            MemorySize: 128
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-lambda"
+            Runtime: "python3.9"
+            Timeout: 303
+            TracingConfig: 
+                Mode: "PassThrough"
+
+
+    LambdaPopularItemsNotify:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${AWS::StackName}-popular-items-notification"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+                ZipFile: !Sub |
+                  import json
+                  import boto3
+                  import base64
+                  import pymysql
+
+
+                  def get_secret():
+                      session = boto3.session.Session()
+                      client = session.client(
+                          service_name='secretsmanager',
+                          region_name="us-east-1"
+                      )
+                      secrets = json.loads(
+                          client.get_secret_value(
+                              SecretId="${AWS::StackName}-rds-mysql"
+                          )['SecretString']
+                      )
+                      return secrets
+
+
+                  def publish_to_sns(sub, msg):
+                      topic_arn = "arn:aws:sns:us-east-1:${AWS::AccountId}:${AWS::StackName}-popular-item-notification"
+                      sns = boto3.client("sns")
+                      response = sns.publish(
+                          TopicArn=topic_arn,
+                          Message=msg,
+                          Subject=sub
+                      )
+
+                  rds_config = get_secret() 
+                  rds_host  = rds_config['host']
+                  name = rds_config['username']
+                  password = rds_config['password']
+                  db_name = 'testdb'
+
+                  conn = pymysql.connect(host=rds_host, user=name, passwd=password, db=db_name, connect_timeout=10)
+
+
+                  def lambda_handler(event, context):
+                    
+                      with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                        cur.execute("select * from items")
+                        items = cur.fetchall()
+                      items = {i.pop('id'):i for i in items}
+
+                      sum_views = 0
+                      records = []
+                      
+                      for record in event['records']:
+                          data = json.loads(base64.b64decode(record['data']))
+                          sum_views += data['items_count']
+                          new_data = {**data, **items.get(data['item_id'],{})}
+                          records.append(new_data)
+                          
+                      print(sum_views)
+                      if sum_views > 2500:
+                          publish_to_sns('There are quite populare items here!', json.dumps(records, indent=4))
+
+            MemorySize: 128
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-lambda"
+            Runtime: "python3.9"
+            Timeout: 303
+            TracingConfig: 
+                Mode: "PassThrough"
+            Layers: 
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:pymysql:1"
+
+
+    LambdaDetectSpamIp:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${AWS::StackName}_detect_spam_ip"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+              ZipFile: !Sub |
+                import json
+                import boto3
+
+
+                client = boto3.client('emr')
+
+
+                def lambda_handler(event, context):
+
+                    bucket = event['Records'][0]['s3']['bucket']['name']
+                    key = event['Records'][0]['s3']['object']['key']
+                    
+                    response = client.run_job_flow(
+                        Name= 'muravev_emrdetect_spam_ip',
+                        LogUri= 's3://${AWS::StackName}-data/logs',
+                        ReleaseLabel= 'emr-6.0.0',
+                        Instances={
+                            'MasterInstanceType': 'm5.xlarge',
+                            'SlaveInstanceType': 'm5.large',
+                            'InstanceCount': 1,
+                            'KeepJobFlowAliveWhenNoSteps': False,
+                            'TerminationProtected': False,
+                            'Ec2SubnetId': 'subnet-4f243661'
+                        },
+                        Applications = [ {'Name': 'Spark'} ],
+                        VisibleToAllUsers=True,
+                        JobFlowRole = 'muravev-emr-ec2',
+                        ServiceRole = 'muravev-emr',
+                        BootstrapActions = [{
+                            'Name': 'install boto3',
+                            'ScriptBootstrapAction': {
+                                'Path': 's3://${AWS::StackName}-code/install_boto3.sh'
+                            }
+                        }],
+                        Steps=[
+                                {
+                                    'Name': 'muravev_detect_spam_ip',
+                                    'ActionOnFailure': 'TERMINATE_CLUSTER',
+                                    'HadoopJarStep': {
+                                        'Jar': 'command-runner.jar',
+                                        'Args': [
+                                            'spark-submit',
+                                            's3://${AWS::StackName}-code/spark-job.py',
+                                            bucket,
+                                            key,
+                                            '${AWS::StackName}-capstone-suspicious-ip'
+
+                                        ]
+                                    }
+                                }
+                            ]
+                    )
+            MemorySize: 128
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-lambda"
+            Runtime: "python3.9"
+            Timeout: 303
+            TracingConfig: 
+                Mode: "PassThrough"
+
+    LambdaEnrichViews:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${AWS::StackName}-enrich-views"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+              ZipFile: !Sub |
+                import json
+                import boto3
+                import base64
+                import pymysql
+
+
+                def get_secret():
+                    session = boto3.session.Session()
+                    client = session.client(
+                        service_name='secretsmanager',
+                        region_name="us-east-1"
+                    )
+                    secrets = json.loads(
+                        client.get_secret_value(
+                            SecretId="${AWS::StackName}-rds-mysql"
+                        )['SecretString']
+                    )
+                    return secrets
+
+
+                rds_config = get_secret() 
+                rds_host  = rds_config['host']
+                name = rds_config['username']
+                password = rds_config['password']
+                db_name = 'testdb'
+
+                conn = pymysql.connect(host=rds_host, user=name, passwd=password, db=db_name, connect_timeout=10)
+
+
+                def lambda_handler(event, context):
+
+                    with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                      cur.execute("select * from items")
+                      items = cur.fetchall()
+                    items = {i.pop('id'):i for i in items}
+
+                    records = []
+                    
+                    for record in event['records']:
+                        data = json.loads(base64.b64decode(record['data']))
+                        new_data = base64.b64encode(
+                            json.dumps({**data, **items.get(data['item_id'],{})}).encode()
+                        )
+                        records.append({
+                            'recordId': record['recordId'],
+                            'result': 'Ok',
+                            'data': new_data
+                        })
+                        
+                    result = {"records": records}
+                    return result
+            MemorySize: 256
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/muravev-lambda"
+            Runtime: "python3.9"
+            Timeout: 303
+            TracingConfig: 
+                Mode: "PassThrough"
+            Layers: 
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:pymysql:1"
+
+    LambdaPermission:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !Ref LambdaDetectSpamIp
+            Principal: "s3.amazonaws.com"
+            SourceArn: !GetAtt S3Bucket.Arn
+
+    LambdaEventSourceMapping:
+        Type: "AWS::Lambda::EventSourceMapping"
+        Properties:
+            BatchSize: 100
+            EventSourceArn: !GetAtt KinesisStreamReviews.Arn
+            FunctionName: !GetAtt LambdaFilterReiews.Arn
+            Enabled: true
+            MaximumBatchingWindowInSeconds: 0
+            ParallelizationFactor: 1
+            MaximumRecordAgeInSeconds: -1
+            BisectBatchOnFunctionError: false
+            MaximumRetryAttempts: -1
+            TumblingWindowInSeconds: 0
+            StartingPosition: 'LATEST'
+
+    LambdaEventSourceMapping2:
+        Type: "AWS::Lambda::EventSourceMapping"
+        Properties:
+            BatchSize: 100
+            EventSourceArn: !GetAtt KinesisStreamViews.Arn
+            FunctionName: !GetAtt LambdaFilterViews.Arn
+            Enabled: true
+            MaximumBatchingWindowInSeconds: 0
+            ParallelizationFactor: 1
+            MaximumRecordAgeInSeconds: -1
+            BisectBatchOnFunctionError: false
+            MaximumRetryAttempts: -1
+            TumblingWindowInSeconds: 0
+            StartingPosition: 'LATEST'
