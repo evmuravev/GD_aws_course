@@ -651,7 +651,7 @@ Resources:
                       session = boto3.session.Session()
                       client = session.client(
                           service_name='secretsmanager',
-                          region_name="us-east-1"
+                          region_name="${AWS::Region}"
                       )
                       secrets = json.loads(
                           client.get_secret_value(
@@ -662,7 +662,7 @@ Resources:
 
 
                   def publish_to_sns(sub, msg):
-                      topic_arn = "arn:aws:sns:us-east-1:${AWS::AccountId}:${AWS::StackName}-popular-item-notification"
+                      topic_arn = "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-popular-item-notification"
                       sns = boto3.client("sns")
                       response = sns.publish(
                           TopicArn=topic_arn,
@@ -798,7 +798,7 @@ Resources:
                     session = boto3.session.Session()
                     client = session.client(
                         service_name='secretsmanager',
-                        region_name="us-east-1"
+                        region_name="${AWS::Region}"
                     )
                     secrets = json.loads(
                         client.get_secret_value(
